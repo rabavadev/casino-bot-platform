@@ -1,0 +1,21 @@
+name = "casino-bot-platform"
+main = "src/worker.ts"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+PUBLIC_BASE_URL = "https://casino-bot-platform.YOUR-SUBDOMAIN.workers.dev"
+
+# Set secrets via CLI (never commit these):
+#   wrangler secret put TOKEN_ENC_KEY
+#   wrangler secret put ADMIN_API_KEY
+#   wrangler secret put IP_HASH_SALT
+#   wrangler secret put DATABASE_URL      # Supabase connection string
+#
+# Or use Hyperdrive for connection pooling (recommended):
+#   wrangler hyperdrive create casino-db --connection-string="postgresql://postgres:PASS@db.PROJECT.supabase.co:5432/postgres"
+#   Then paste the returned ID below and remove the DATABASE_URL secret.
+
+# [[hyperdrive]]
+# binding = "HYPERDRIVE"
+# id = ""
