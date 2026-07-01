@@ -4,7 +4,7 @@ compatibility_date = "2025-01-01"
 compatibility_flags = ["nodejs_compat"]
 
 [vars]
-PUBLIC_BASE_URL = "https://casino-bot-platform.YOUR-SUBDOMAIN.workers.dev"
+PUBLIC_BASE_URL = "https://casino-bot-platform.rabava.workers.dev"
 
 # Set secrets via CLI (never commit these):
 #   wrangler secret put TOKEN_ENC_KEY
