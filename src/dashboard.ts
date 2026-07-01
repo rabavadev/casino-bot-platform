@@ -20,8 +20,10 @@
 import { Hono } from "hono";
 import { config } from "./config.js";
 import { one, query } from "./db.js";
-import { encryptToken, newLinkSlug, newWebhookSecret } from "./crypto.js";
+import { encryptToken, newLinkSlug, newPostbackKey, newWebhookSecret } from "./crypto.js";
 import { getMe, setWebhook } from "./telegram.js";
+import { PLANS, checkFeature, checkLimit, getUserPlan, type PlanTier } from "./plans.js";
+import { billingEnabled, createStarsInvoice } from "./billing.js";
 
 // ---------------- session helpers ----------------
 
@@ -168,6 +170,8 @@ export function buildDashboard(): Hono {
     if (!b.casino || !b.label || !b.referral_url)
       return c.json({ error: "casino, label, referral_url required" }, 400);
     try { new URL(b.referral_url); } catch { return c.json({ error: "referral_url must be a valid URL" }, 400); }
+    const limitErr = await checkLimit(c.get("uid"), "offers");
+    if (limitErr) return c.json({ error: limitErr }, 402);
 
     const uid = c.get("uid");
     const slug = b.casino.toLowerCase().replace(/[^a-z0-9]+/g, "-");
@@ -223,6 +227,8 @@ export function buildDashboard(): Hono {
   api.post("/bots", async (c) => {
     const { token, welcome_message } = await c.req.json<{ token: string; welcome_message?: string }>();
     if (!token) return c.json({ error: "token required" }, 400);
+    const limitErr = await checkLimit(c.get("uid"), "bots");
+    if (limitErr) return c.json({ error: limitErr }, 402);
     let me;
     try { me = await getMe(token); }
     catch { return c.json({ error: "Telegram rejected that token — double-check it in @BotFather" }, 400); }
@@ -241,6 +247,85 @@ export function buildDashboard(): Hono {
     ))!;
     await setWebhook(token, `${config.publicBaseUrl}/hook/${secret}`, secret);
     return c.json({ bot_id: row.id, username: me.username, try_it: `https://t.me/${me.username}` });
+  });
+
+  // ---- plan & billing ----
+  api.get("/plan", async (c) => {
+    const plan = await getUserPlan(c.get("uid"));
+    return c.json({
+      current: plan,
+      billing_enabled: billingEnabled(),
+      plans: Object.values(PLANS),
+    });
+  });
+
+  api.post("/billing/checkout", async (c) => {
+    if (!billingEnabled()) return c.json({ error: "billing not configured on this deployment" }, 400);
+    const { plan } = await c.req.json<{ plan: PlanTier }>();
+    if (!PLANS[plan] || PLANS[plan].starsPrice <= 0) return c.json({ error: "invalid plan" }, 400);
+    const link = await createStarsInvoice(c.get("uid"), plan);
+    return c.json({ invoice_link: link });
+  });
+
+  // ---- broadcasts ----
+  api.get("/broadcasts", async (c) => {
+    return c.json(await query(
+      `SELECT b.id, b.body, b.status, b.scheduled_at, b.sent_at,
+              b.total_count, b.sent_count, b.fail_count, bo.username AS bot_username
+         FROM broadcasts b JOIN bots bo ON bo.id = b.bot_id
+        WHERE bo.owner_id = $1
+        ORDER BY b.created_at DESC LIMIT 20`,
+      [c.get("uid")]
+    ));
+  });
+
+  api.post("/broadcasts", async (c) => {
+    const uid = c.get("uid");
+    const gateErr = await checkFeature(uid, "broadcasts");
+    if (gateErr) return c.json({ error: gateErr }, 402);
+
+    const { bot_id, body, scheduled_at } = await c.req.json<{
+      bot_id: string; body: string; scheduled_at?: string;
+    }>();
+    if (!bot_id || !body?.trim()) return c.json({ error: "bot_id and body required" }, 400);
+
+    const bot = await one(`SELECT id FROM bots WHERE id = $1 AND owner_id = $2`, [bot_id, uid]);
+    if (!bot) return c.json({ error: "bot not found" }, 404);
+
+    const row = await one(
+      `INSERT INTO broadcasts (bot_id, body, status, scheduled_at)
+       VALUES ($1, $2, 'scheduled', $3)
+       RETURNING id, status`,
+      [bot_id, body.trim(), scheduled_at ?? null]
+    );
+    return c.json(row);
+  });
+
+  // ---- postbacks ----
+  api.post("/postback-key", async (c) => {
+    const uid = c.get("uid");
+    const gateErr = await checkFeature(uid, "postbacks");
+    if (gateErr) return c.json({ error: gateErr }, 402);
+    const existing = await one<{ postback_key: string | null }>(
+      `SELECT postback_key FROM users WHERE id = $1`, [uid]
+    );
+    let key = existing?.postback_key;
+    if (!key) {
+      key = newPostbackKey();
+      await query(`UPDATE users SET postback_key = $1 WHERE id = $2`, [key, uid]);
+    }
+    return c.json({ postback_url: `${config.publicBaseUrl}/pb/${key}` });
+  });
+
+  api.get("/conversions", async (c) => {
+    return c.json(await query(
+      `SELECT cv.event, cv.amount, cv.currency, cv.click_ref,
+              to_char(cv.ts, 'MM-DD HH24:MI') AS at, o.label AS offer
+         FROM conversions cv LEFT JOIN offers o ON o.id = cv.offer_id
+        WHERE cv.owner_id = $1
+        ORDER BY cv.ts DESC LIMIT 25`,
+      [c.get("uid")]
+    ));
   });
 
   app.route("/dash/api", api);
@@ -362,6 +447,28 @@ const APP_HTML = `<!doctype html><html><head><meta charset="utf-8">
     <table><thead><tr><th>Offer</th><th>Link</th><th>Clicks</th><th>Unique</th><th>Status</th><th></th></tr></thead>
     <tbody id="offers"></tbody></table>
   </div>
+
+  <div class="panel"><h2>Broadcast to subscribers</h2>
+    <div id="bcGate" class="muted" style="display:none;margin-bottom:10px"></div>
+    <textarea id="bcBody" rows="3" placeholder="Message to all your bot's subscribers (Markdown supported)"></textarea>
+    <button onclick="sendBroadcast()">Send broadcast</button>
+    <table style="margin-top:14px"><thead><tr><th>Message</th><th>Status</th><th>Sent</th><th>Failed</th></tr></thead>
+    <tbody id="bcList"></tbody></table>
+  </div>
+
+  <div class="panel"><h2>Conversions (postbacks)</h2>
+    <p class="muted" style="margin-bottom:10px">Give your affiliate manager this postback URL and add
+      <code>{click_ref}</code> anywhere in your affiliate URL to attribute deposits to clicks.</p>
+    <div style="margin-bottom:10px"><button class="ghost" onclick="revealPostback()">Show my postback URL</button>
+      <span id="pbUrl" class="copy" style="margin-left:8px"></span></div>
+    <table><thead><tr><th>When</th><th>Event</th><th>Amount</th><th>Offer</th></tr></thead>
+    <tbody id="convList"></tbody></table>
+  </div>
+
+  <div class="panel"><h2>Plan</h2>
+    <div id="planInfo" class="muted">Loading…</div>
+    <div id="planButtons" style="margin-top:12px"></div>
+  </div>
 </div>
 <div id="toast"></div>
 <script>
@@ -425,5 +532,49 @@ async function connectBot(){
   if (r.error) return toast(r.error);
   $('botToken').value=''; toast('Bot @'+r.username+' connected'); load();
 }
-load();
+
+let firstBotId = null;
+async function loadExtras(){
+  const [plan, bcs, convs, bots] = await Promise.all([api('/plan'), api('/broadcasts'), api('/conversions'), api('/bots')]);
+  firstBotId = bots[0]?.id ?? null;
+
+  // plan panel
+  const cur = plan.current;
+  $('planInfo').innerHTML = '<b style="color:var(--accent)">'+cur.label+'</b> — up to '+cur.maxBots+' bots, '
+    +cur.maxOffers+' offers'+(cur.broadcasts?', broadcasts':'')+(cur.postbacks?', postbacks':'');
+  $('planButtons').innerHTML = plan.plans.filter(p=>p.starsPrice>0 && p.tier!==cur.tier).map(p=>
+    '<button onclick="upgrade(\\''+p.tier+'\\')" style="margin-right:8px">'
+    +(plan.billing_enabled?'Upgrade to '+p.label+' — ⭐'+p.starsPrice+'/30d':p.label+' (billing not enabled)')+'</button>'
+  ).join('');
+
+  // broadcasts panel
+  $('bcList').innerHTML = bcs.map(b=>'<tr><td>'+esc(b.body.slice(0,60))+'</td><td>'+b.status+'</td>'+
+    '<td>'+b.sent_count+'/'+(b.total_count||'?')+'</td><td>'+b.fail_count+'</td></tr>').join('')
+    || '<tr><td colspan="4" class="muted">No broadcasts yet.</td></tr>';
+
+  // conversions panel
+  $('convList').innerHTML = convs.map(v=>'<tr><td>'+v.at+'</td><td>'+esc(v.event)+'</td>'+
+    '<td>'+(v.amount?v.amount+' '+v.currency:'–')+'</td><td>'+esc(v.offer||'–')+'</td></tr>').join('')
+    || '<tr><td colspan="4" class="muted">No conversions reported yet.</td></tr>';
+}
+async function sendBroadcast(){
+  const body = $('bcBody').value.trim();
+  if (!body) return toast('Write a message first');
+  if (!firstBotId) return toast('Connect a bot first');
+  const r = await api('/broadcasts',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({bot_id:firstBotId, body})});
+  if (r.error) return toast(r.error);
+  $('bcBody').value=''; toast('Broadcast queued'); loadExtras();
+}
+async function revealPostback(){
+  const r = await api('/postback-key',{method:'POST'});
+  if (r.error) return toast(r.error);
+  $('pbUrl').textContent = r.postback_url + '?event=deposit&amount=50&click_ref=XXX';
+  $('pbUrl').onclick = ()=>{ navigator.clipboard.writeText(r.postback_url); toast('Postback URL copied'); };
+}
+async function upgrade(tier){
+  const r = await api('/billing/checkout',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({plan:tier})});
+  if (r.error) return toast(r.error);
+  window.open(r.invoice_link, '_blank');
+}
+load(); loadExtras();
 </script></body></html>`;

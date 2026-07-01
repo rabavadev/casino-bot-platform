@@ -108,3 +108,28 @@ npm run dev:worker
 # Or test a real bot via long polling (no hosting)
 bun src/demo.ts <bot-token>
 ```
+
+## Tier 2/3 additions (billing, broadcasts, postbacks)
+
+After deploying, run the migration against your database:
+
+    psql "$DATABASE_URL" -f migrations/002_tier23.sql
+
+### Telegram Stars billing (optional)
+1. Create a **platform bot** in @BotFather (this is YOUR bot, used only for payments).
+2. `wrangler secret put PLATFORM_BOT_TOKEN` and `wrangler secret put PLATFORM_WEBHOOK_SECRET` (any random string).
+3. Point the bot's webhook here once:
+   `curl -X POST "$PUBLIC_BASE_URL/api/billing/setup" -H "x-api-key: $ADMIN_API_KEY"`
+Streamers then see Upgrade buttons in the dashboard; payments arrive in Stars (XTR) and activate the plan for 30 days. Expired plans downgrade automatically at the nightly cron.
+
+### Broadcasts
+Queued from the dashboard, sent by the every-minute Cron Trigger at ~28 msg/s in resumable batches. Requires Pro.
+
+### Postbacks (deposit / CPA tracking)
+1. Streamer clicks "Show my postback URL" in the dashboard (Pro only).
+2. They add `{click_ref}` anywhere in their affiliate URL — it is replaced per click.
+3. The casino/network calls `GET /pb/<key>?event=deposit&amount=50&currency=USD&click_ref=...`
+   (also accepts `clickid`, `subid`, `sub_id`). Conversions show up in the dashboard, attributed to the offer.
+
+### Cron Triggers
+`wrangler.toml` registers `* * * * *` (broadcast batches) and `0 3 * * *` (click rollup into `click_daily`, next-month partition creation, expired-plan downgrades).

@@ -57,3 +57,13 @@ export function newWebhookSecret(): string {
 export function newLinkSlug(): string {
   return Buffer.from(crypto.getRandomValues(new Uint8Array(4))).toString("base64url");
 }
+
+/** Public click reference id — echoed back by casinos in postbacks. */
+export function newClickRef(): string {
+  return Buffer.from(crypto.getRandomValues(new Uint8Array(9))).toString("base64url");
+}
+
+/** Secret per-streamer postback key. */
+export function newPostbackKey(): string {
+  return Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString("base64url");
+}

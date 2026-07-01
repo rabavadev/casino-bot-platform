@@ -7,7 +7,8 @@ export async function logClick(
   userAgent: string | null,
   referer: string | null,
   country: string | null,
-  tgUserId: number | null
+  tgUserId: number | null,
+  clickRef: string | null = null
 ): Promise<void> {
   try {
     const ipH = await hashIp(ip);
@@ -21,9 +22,9 @@ export async function logClick(
       [shortLinkId, ipH]
     );
     await query(
-      `INSERT INTO clicks (short_link_id, ip_hash, country, user_agent, referer, tg_user_id, is_unique)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [shortLinkId, ipH, country, userAgent, referer, tgUserId, !dup?.seen]
+      `INSERT INTO clicks (short_link_id, ip_hash, country, user_agent, referer, tg_user_id, is_unique, click_ref)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [shortLinkId, ipH, country, userAgent, referer, tgUserId, !dup?.seen, clickRef]
     );
   } catch (err) {
     console.error("click log failed:", err);

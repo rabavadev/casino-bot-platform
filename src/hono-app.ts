@@ -2,11 +2,13 @@ import { Hono } from "hono";
 import type { Update } from "grammy/types";
 import { config } from "./config.js";
 import { one, query } from "./db.js";
-import { encryptToken, newLinkSlug, newWebhookSecret } from "./crypto.js";
+import { encryptToken, newClickRef, newLinkSlug, newWebhookSecret } from "./crypto.js";
 import { getBotBySecret, handleUpdateForBot } from "./botEngine.js";
 import { getMe, setWebhook } from "./telegram.js";
 import { buildDashboard } from "./dashboard.js";
 import { logClick } from "./clicks.js";
+import { billingEnabled, handleBillingUpdate, setupBillingWebhook } from "./billing.js";
+import { checkLimit } from "./plans.js";
 
 type Bindings = {
   PUBLIC_BASE_URL: string;
@@ -55,6 +57,13 @@ export function buildHonoApp(): Hono<{ Bindings: Bindings }> {
     const country = c.req.header("cf-ipcountry") ?? null;
     const ip = c.req.header("cf-connecting-ip") ?? "0.0.0.0";
 
+    // Click reference: substituted into the affiliate URL so casinos
+    // can echo it back via postback ({click_ref} or {click_id}).
+    const ref = newClickRef();
+    const destination = link.referral_url
+      .replaceAll("{click_ref}", ref)
+      .replaceAll("{click_id}", ref);
+
     // On Workers, use waitUntil so the click log survives the response.
     // On Node (hono dev), fall back to fire-and-forget.
     let ctx: any = null;
@@ -66,9 +75,63 @@ export function buildHonoApp(): Hono<{ Bindings: Bindings }> {
       link.id, ip,
       c.req.header("user-agent") ?? null,
       c.req.header("referer") ?? null,
-      country, tgUserId
+      country, tgUserId, ref
     ));
-    return c.redirect(link.referral_url);
+    return c.redirect(destination);
+  });
+
+  // =================================================================
+  // 2b) CASINO POSTBACKS — /pb/:key?event=deposit&amount=50&click_ref=x
+  //     The key is the streamer's secret postback_key. Casinos /
+  //     affiliate networks call this on registration / deposit.
+  // =================================================================
+  app.on(["GET", "POST"], "/pb/:key", async (c) => {
+    const owner = await one<{ id: string }>(
+      `SELECT id FROM users WHERE postback_key = $1`,
+      [c.req.param("key")]
+    );
+    if (!owner) return c.json({ error: "unknown key" }, 404);
+
+    const q = c.req.query();
+    const clickRef = q.click_ref ?? q.clickid ?? q.subid ?? q.sub_id ?? null;
+    const event = (q.event ?? q.goal ?? "deposit").toLowerCase().slice(0, 32);
+    const amount = q.amount && !isNaN(Number(q.amount)) ? Number(q.amount) : null;
+    const currency = (q.currency ?? "USD").toUpperCase().slice(0, 8);
+
+    // Attribute to an offer via the click ref when possible.
+    let offerId: string | null = null;
+    if (clickRef) {
+      const hit = await one<{ offer_id: string }>(
+        `SELECT sl.offer_id FROM clicks cl
+           JOIN short_links sl ON sl.id = cl.short_link_id
+          WHERE cl.click_ref = $1 LIMIT 1`,
+        [clickRef]
+      );
+      offerId = hit?.offer_id ?? null;
+    }
+
+    await query(
+      `INSERT INTO conversions (owner_id, offer_id, click_ref, event, amount, currency, raw)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [owner.id, offerId, clickRef, event, amount, currency, JSON.stringify(q)]
+    );
+    return c.json({ ok: true });
+  });
+
+  // =================================================================
+  // 2c) BILLING WEBHOOK — platform bot (Telegram Stars payments)
+  // =================================================================
+  app.post("/billing/hook/:secret", async (c) => {
+    const secret = c.req.param("secret");
+    if (
+      !billingEnabled() ||
+      secret !== process.env.PLATFORM_WEBHOOK_SECRET ||
+      c.req.header("x-telegram-bot-api-secret-token") !== secret
+    ) {
+      return c.body(null, 401);
+    }
+    await handleBillingUpdate(await c.req.json<Update>());
+    return c.body(null, 200);
   });
 
   // =================================================================
@@ -96,6 +159,8 @@ export function buildHonoApp(): Hono<{ Bindings: Bindings }> {
       owner_id: string; token: string; welcome_message?: string;
     }>();
     if (!owner_id || !token) return c.json({ error: "owner_id and token required" }, 400);
+    const limitErr = await checkLimit(owner_id, "bots");
+    if (limitErr) return c.json({ error: limitErr }, 402);
 
     const me = await getMe(token);
     const secret = newWebhookSecret();
@@ -125,6 +190,8 @@ export function buildHonoApp(): Hono<{ Bindings: Bindings }> {
     }>();
     if (!body.owner_id || !body.casino || !body.label || !body.referral_url)
       return c.json({ error: "owner_id, casino, label, referral_url required" }, 400);
+    const limitErr = await checkLimit(body.owner_id, "offers");
+    if (limitErr) return c.json({ error: limitErr }, 402);
 
     const slug = body.casino.toLowerCase().replace(/[^a-z0-9]+/g, "-");
     const casinoRow = (await one<{ id: string }>(
@@ -164,6 +231,14 @@ export function buildHonoApp(): Hono<{ Bindings: Bindings }> {
         GROUP BY o.id, o.label, c.name ORDER BY clicks DESC`,
       [owner_id, days]
     ));
+  });
+
+  // One-time setup: point the platform bot's webhook here (admin only).
+  api.post("/billing/setup", async (c) => {
+    if (!billingEnabled())
+      return c.json({ error: "set PLATFORM_BOT_TOKEN and PLATFORM_WEBHOOK_SECRET first" }, 400);
+    await setupBillingWebhook(config.publicBaseUrl);
+    return c.json({ ok: true, webhook: `${config.publicBaseUrl}/billing/hook/***` });
   });
 
   app.route("/api", api);
