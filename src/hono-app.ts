@@ -5,6 +5,7 @@ import { one, query } from "./db.js";
 import { encryptToken, newLinkSlug, newWebhookSecret } from "./crypto.js";
 import { getBotBySecret, handleUpdateForBot } from "./botEngine.js";
 import { getMe, setWebhook } from "./telegram.js";
+import { buildDashboard } from "./dashboard.js";
 import { logClick } from "./clicks.js";
 
 type Bindings = {
@@ -56,8 +57,11 @@ export function buildHonoApp(): Hono<{ Bindings: Bindings }> {
 
     // On Workers, use waitUntil so the click log survives the response.
     // On Node (hono dev), fall back to fire-and-forget.
-    const ctx = (c as any).executionCtx;
-    const bg = ctx?.waitUntil ?? ((p: Promise<unknown>) => void p);
+    let ctx: any = null;
+    try { ctx = (c as any).executionCtx; } catch { /* not on Workers */ }
+    const bg = ctx?.waitUntil
+      ? (p: Promise<unknown>) => ctx.waitUntil(p)
+      : (p: Promise<unknown>) => void p.catch(() => {});
     bg(logClick(
       link.id, ip,
       c.req.header("user-agent") ?? null,
@@ -163,5 +167,12 @@ export function buildHonoApp(): Hono<{ Bindings: Bindings }> {
   });
 
   app.route("/api", api);
+
+  // =================================================================
+  // 4) STREAMER DASHBOARD (Telegram Login + self-serve UI)
+  // =================================================================
+  app.route("/", buildDashboard());
+  app.get("/", (c) => c.redirect("/dashboard"));
+
   return app;
 }

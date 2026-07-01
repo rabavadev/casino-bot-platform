@@ -16,6 +16,9 @@ export default {
     pe.TOKEN_ENC_KEY = env.TOKEN_ENC_KEY;
     pe.ADMIN_API_KEY = env.ADMIN_API_KEY;
     pe.IP_HASH_SALT = env.IP_HASH_SALT;
+    pe.LOGIN_BOT_TOKEN = env.LOGIN_BOT_TOKEN;
+    pe.LOGIN_BOT_USERNAME = env.LOGIN_BOT_USERNAME;
+    pe.ALLOW_DEV_LOGIN = env.ALLOW_DEV_LOGIN;
 
     const { buildHonoApp } = await import("./hono-app.js");
     const app = buildHonoApp();
